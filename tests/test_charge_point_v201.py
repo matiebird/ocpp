@@ -3,10 +3,12 @@
 import asyncio
 import copy
 from datetime import datetime, timedelta, UTC
+import json
 
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant, ServiceResponse
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import template as template_helper
 from ocpp.v16.enums import Measurand
 
 from custom_components.ocpp.const import CONF_CPIDS, CONF_CPID, DOMAIN
@@ -421,9 +423,9 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
         "id_token": cs.charge_points[cs.cpids[cpid]]._remote_id_tag,
         "type": IdTokenEnumType.central.value,
     }
-    while cs.get_metric(cpid, csess.transaction_id.value) is None:
+    while cs.get_metric(cpid, csess.transaction_id) is None:
         await asyncio.sleep(0.1)
-    assert cs.get_metric(cpid, csess.transaction_id.value) == cp.remote_start_tx_id
+    assert cs.get_metric(cpid, csess.transaction_id) == cp.remote_start_tx_id
 
     tx_start_time = cp.tx_start_time
     await cp.call(
@@ -431,10 +433,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
             tx_start_time.isoformat(), ConnectorStatusEnumType.occupied, 1, 1
         )
     )
-    assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
-        == ChargePointStatusv16.preparing
-    )
+    assert cs.get_metric(cpid, cstat.status_connector) == ChargePointStatusv16.preparing
 
     await cp.call(
         call.TransactionEvent(
@@ -603,10 +602,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
             ],
         )
     )
-    assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
-        == ChargePointStatusv16.charging
-    )
+    assert cs.get_metric(cpid, cstat.status_connector) == ChargePointStatusv16.charging
     assert cs.get_metric(cpid, Measurand.current_export.value) == 0
     assert cs.get_metric(cpid, Measurand.current_import.value) == pytest.approx(2.2)
     assert cs.get_metric(cpid, Measurand.current_offered.value) == pytest.approx(12.2)
@@ -718,10 +714,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
             ],
         )
     )
-    assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
-        == ChargePointStatusv16.preparing
-    )
+    assert cs.get_metric(cpid, cstat.status_connector) == ChargePointStatusv16.preparing
     await cp.call(
         call.TransactionEvent(
             TransactionEventEnumType.updated.value,
@@ -761,8 +754,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
         )
     )
     assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
-        == ChargePointStatusv16.suspended_ev
+        cs.get_metric(cpid, cstat.status_connector) == ChargePointStatusv16.suspended_ev
     )
 
     await cp.call(
@@ -778,7 +770,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
         )
     )
     assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
+        cs.get_metric(cpid, cstat.status_connector)
         == ChargePointStatusv16.suspended_evse
     )
 
@@ -795,10 +787,7 @@ async def _test_transaction(hass: HomeAssistant, cs: CentralSystem, cp: ChargePo
             },
         )
     )
-    assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
-        == ChargePointStatusv16.available
-    )
+    assert cs.get_metric(cpid, cstat.status_connector) == ChargePointStatusv16.available
 
 
 async def _set_variable(
@@ -998,8 +987,61 @@ async def _test_charge_profiles(
         ],
     }
 
-    await set_number(hass, cpid, "maximum_current", 12)
+    transaction_id = "x','id':2,'transactionId':'y"
+
+    def custom_tx_profile(profile_id: int) -> dict:
+        return {
+            "id": profile_id,
+            "stackLevel": 1,
+            "chargingProfilePurpose": "TxProfile",
+            "chargingProfileKind": "Relative",
+            "transactionId": transaction_id,
+            "chargingSchedule": [
+                {
+                    "id": 1,
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 6}],
+                }
+            ],
+        }
+
+    json_profile = custom_tx_profile(3)
+    error = await _set_charge_rate_service(
+        hass,
+        {
+            "devid": cpid,
+            "conn_id": 1,
+            "custom_profile": json.dumps(json_profile),
+        },
+    )
+    assert error is None
     assert len(cp.charge_profiles_set) == 4
+    assert cp.charge_profiles_set[-1].evse_id == 1
+    assert cp.charge_profiles_set[-1].charging_profile["id"] == 3
+    assert (
+        cp.charge_profiles_set[-1].charging_profile["transaction_id"] == transaction_id
+    )
+
+    wrapped_profile = template_helper._parse_result(repr(custom_tx_profile(4)))
+    assert isinstance(wrapped_profile, dict)
+    error = await _set_charge_rate_service(
+        hass,
+        {
+            "devid": cpid,
+            "conn_id": 1,
+            "custom_profile": wrapped_profile,
+        },
+    )
+    assert error is None
+    assert len(cp.charge_profiles_set) == 5
+    assert cp.charge_profiles_set[-1].evse_id == 1
+    assert cp.charge_profiles_set[-1].charging_profile["id"] == 4
+    assert (
+        cp.charge_profiles_set[-1].charging_profile["transaction_id"] == transaction_id
+    )
+
+    await set_number(hass, cpid, "maximum_current", 12)
+    assert len(cp.charge_profiles_set) == 6
     assert cp.charge_profiles_set[-1].evse_id == 0
     assert cp.charge_profiles_set[-1].charging_profile == {
         "id": 1,
@@ -1072,23 +1114,23 @@ async def _run_test(hass: HomeAssistant, cs: CentralSystem, cp: ChargePoint):
     # Checking only the reply let a metric-less handler pass for the bug's
     # whole life: the sensor's backing metric must hold the same instant
     # the charger was told.
-    assert cs.get_metric(cpid, cstat.heartbeat.value) == heartbeat_time
+    assert cs.get_metric(cpid, cstat.heartbeat) == heartbeat_time
 
     await wait_ready(cs.charge_points[cp_id])
 
     # Junk report to be ignored
     await cp.call(call.NotifyReport(2, datetime.now(tz=UTC).isoformat(), 0))
 
-    assert cs.get_metric(cpid, cdet.serial.value, connector_id=0) == "SERIAL"
-    assert cs.get_metric(cpid, cdet.model.value, connector_id=0) == "MODEL"
-    assert cs.get_metric(cpid, cdet.vendor.value, connector_id=0) == "VENDOR"
-    assert cs.get_metric(cpid, cdet.firmware_version.value, connector_id=0) == "VERSION"
+    assert cs.get_metric(cpid, cdet.serial, connector_id=0) == "SERIAL"
+    assert cs.get_metric(cpid, cdet.model, connector_id=0) == "MODEL"
+    assert cs.get_metric(cpid, cdet.vendor, connector_id=0) == "VENDOR"
+    assert cs.get_metric(cpid, cdet.firmware_version, connector_id=0) == "VERSION"
     assert (
-        cs.get_metric(cpid, cdet.features.value, connector_id=0)
+        cs.get_metric(cpid, cdet.features, connector_id=0)
         == Profiles.CORE | Profiles.SMART | Profiles.RES | Profiles.AUTH
     )
     assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
+        cs.get_metric(cpid, cstat.status_connector)
         == ConnectorStatusEnumType.available.value
     )
     # The station-level notification landed on the charger-level Status metric
@@ -1096,14 +1138,14 @@ async def _run_test(hass: HomeAssistant, cs: CentralSystem, cp: ChargePoint):
     # switch reads) and did not overwrite the connector's own status above.
     server_cp = cs.charge_points[cp_id]
     assert (
-        server_cp._metrics[(0, cstat.status.value)].value
+        server_cp._metrics[(0, cstat.status)].value
         == ConnectorStatusEnumType.unavailable.value
     )
     # (0, Status.Connector) stays owned by the EVSE aggregation - a
     # station-level 'Unavailable' written there would mask the connector's real
     # state through the flattened sensor's fallback chain.
     assert (
-        server_cp._metrics[(0, cstat.status_connector.value)].value
+        server_cp._metrics[(0, cstat.status_connector)].value
         != ConnectorStatusEnumType.unavailable.value
     )
     assert cp.tx_updated_interval == DEFAULT_METER_INTERVAL
@@ -1139,7 +1181,7 @@ async def _run_test(hass: HomeAssistant, cs: CentralSystem, cp: ChargePoint):
         )
     )
     assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
+        cs.get_metric(cpid, cstat.status_connector)
         == ConnectorStatusEnumType.unavailable.value
     )
 
@@ -1149,7 +1191,7 @@ async def _run_test(hass: HomeAssistant, cs: CentralSystem, cp: ChargePoint):
         )
     )
     assert (
-        cs.get_metric(cpid, cstat.status_connector.value)
+        cs.get_metric(cpid, cstat.status_connector)
         == ConnectorStatusEnumType.faulted.value
     )
 
@@ -1200,7 +1242,7 @@ async def _extra_features_test(
     await wait_ready(cs.charge_points[cp_id])
 
     assert (
-        cs.get_metric(cpid, cdet.features.value, connector_id=0)
+        cs.get_metric(cpid, cdet.features, connector_id=0)
         == Profiles.CORE
         | Profiles.SMART
         | Profiles.RES
@@ -1298,7 +1340,7 @@ async def _unsupported_base_report_test(
     # test charger enables (tests/const.py). Before the override was honoured
     # on 2.0.1 this expectation omitted SMART.
     assert (
-        cs.get_metric(cpid, cdet.features.value, connector_id=0)
+        cs.get_metric(cpid, cdet.features, connector_id=0)
         == Profiles.CORE | Profiles.REM | Profiles.FW | Profiles.SMART
     )
 
@@ -1312,7 +1354,7 @@ async def _unsupported_base_report_test(
     # repair (issue #2008 companion). See get_number_of_connectors in ocppv201.
     server_cp = cs.charge_points[cp_id]
     assert server_cp.num_connectors >= 1
-    assert server_cp._metrics[(1, csess.session_time.value)].unit == UnitOfTime.MINUTES
+    assert server_cp._metrics[(1, csess.session_time)].unit == UnitOfTime.MINUTES
 
     # Creating the connector slots is only half the job: a StatusNotification
     # must still be routable to them. A GetBaseReport answered with a CallError
@@ -1328,7 +1370,7 @@ async def _unsupported_base_report_test(
         )
     )
     while (
-        cs.get_metric(cpid, cstat.status_connector.value, connector_id=1)
+        cs.get_metric(cpid, cstat.status_connector, connector_id=1)
         != ChargePointStatusv16.preparing.value
     ):
         await asyncio.sleep(0.1)
@@ -1383,14 +1425,14 @@ async def _incomplete_inventory_test(
     # Inventory reported zero connectors -> normalised to the topology
     # observed in the buffered StatusNotification: one real connector.
     assert server_cp.num_connectors == 1
-    assert server_cp._metrics[(1, csess.session_time.value)].unit == UnitOfTime.MINUTES
+    assert server_cp._metrics[(1, csess.session_time)].unit == UnitOfTime.MINUTES
     # The buffered StatusNotification must be applied once the fallback
     # connector map is built - not held in _pending_status_notifications -
     # and must land on global connector 1, i.e. the map must reflect the
     # charger's real (evse_id, connector_id) pair rather than an assumed
     # (1, 1).
     while (
-        cs.get_metric(cpid, cstat.status_connector.value, connector_id=1)
+        cs.get_metric(cpid, cstat.status_connector, connector_id=1)
         != ChargePointStatusv16.preparing.value
     ):
         await asyncio.sleep(0.1)
@@ -1402,7 +1444,7 @@ async def _incomplete_inventory_test(
     # owned by the EVSE aggregation and would mask the connector's state via
     # the flattened sensor's fallback chain.
     assert (
-        server_cp._metrics[(0, cstat.status.value)].value
+        server_cp._metrics[(0, cstat.status)].value
         == ConnectorStatusEnumType.available.value
     )
 
@@ -1451,7 +1493,7 @@ async def _incomplete_inventory_late_evidence_test(
         )
     )
     while (
-        cs.get_metric(cpid, cstat.status_connector.value, connector_id=1)
+        cs.get_metric(cpid, cstat.status_connector, connector_id=1)
         != ChargePointStatusv16.preparing.value
     ):
         await asyncio.sleep(0.1)

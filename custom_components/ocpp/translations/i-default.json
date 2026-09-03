@@ -28,6 +28,8 @@
                     "cpid": "Charge point identity",
                     "max_current": "Maximum charging current",
                     "meter_interval": "Charging sample interval (seconds)",
+                    "heartbeat_interval": "OCPP heartbeat interval requested from this charger (seconds)",
+                    "charger_websocket_ping_interval": "Charger-generated WebSocket ping interval (seconds, optional)",
                     "monitored_variables_autoconfig": "Automatic detection of OCPP Measurands",
                     "idle_interval": "Charger idle sampling interval (seconds)",
                     "skip_schema_validation": "Skip OCPP schema validation",
@@ -114,6 +116,15 @@
         },
         "set_charge_rate_error": {
             "message": "Failed to set charging current limit: {message}"
+        },
+        "invalid_custom_profile": {
+            "message": "Invalid custom charging profile: {message}"
+        },
+        "not_found": {
+            "message": "No charger found for device id {message}. Check the devid matches the HA charger id (cpid) or the OCPP charger id."
+        },
+        "ambiguous_devid": {
+            "message": "Charger id {message} is ambiguous: several central systems have a charger with that OCPP id. Use the HA charger id (cpid) instead, which is unique."
         }
     },
     "options": {
@@ -131,6 +142,8 @@
                 "data": {
                     "max_current": "Maximum charging current",
                     "meter_interval": "Charging sample interval (seconds)",
+                    "heartbeat_interval": "OCPP heartbeat interval requested from this charger (seconds)",
+                    "charger_websocket_ping_interval": "Charger-generated WebSocket ping interval (seconds, optional)",
                     "monitored_variables_autoconfig": "Automatic detection of OCPP Measurands",
                     "idle_interval": "Charger idle sampling interval (seconds)",
                     "skip_schema_validation": "Skip OCPP schema validation",

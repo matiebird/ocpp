@@ -16,5 +16,5 @@
 		"ocpp>=2.1.0",
 		"websockets>=14.1"
 	],
-	"version": "0.11.1.dev0+9fb32d0.ocular4-stale-tx-fix"
+	"version": "0.11.2.dev0+timing.ocular5"
 }
