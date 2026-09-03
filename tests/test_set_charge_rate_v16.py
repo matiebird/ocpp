@@ -17,13 +17,25 @@ from custom_components.ocpp.ocppv16 import ChargePoint as ChargePointv16
 from custom_components.ocpp.enums import (
     Profiles as prof,
     ConfigurationKey as ckey,
+    HAChargerStatuses as cstat,
 )
 from ocpp.v16.enums import (
+    ChargePointStatus,
+    ClearChargingProfileStatus,
     ChargingProfileStatus,
     ChargingProfilePurposeType,
     ChargingProfileKindType,
     ChargingRateUnitType,
 )
+
+
+def _mark_ocular(cp):
+    """Give a minimal charge point the commissioned Ocular identity/state."""
+    cp.id = "ocular"
+    cp.settings = SimpleNamespace(cpid="ocular")
+    cp._metrics = {}
+    cp._active_tx = {}
+    return cp
 
 
 @pytest.fixture
@@ -43,6 +55,118 @@ def cp_v16():
     # - cp.call(req)
     # - cp.notify_ha(msg)
     return cp
+
+
+@pytest.mark.asyncio
+async def test_ocular_rejects_watt_limit_without_sending_ocpp(cp_v16, monkeypatch):
+    """A watt request must not silently become the default 32 amp limit."""
+    _mark_ocular(cp_v16)
+    calls = []
+
+    async def fake_call(req):
+        calls.append(req)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+
+    assert await cp_v16.set_charge_rate(limit_watts=1000, conn_id=1) is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ocular_rejects_custom_profile_without_sending_ocpp(cp_v16, monkeypatch):
+    """The advanced custom-profile escape hatch cannot bypass Ocular safety."""
+    _mark_ocular(cp_v16)
+    calls = []
+
+    async def fake_call(req):
+        calls.append(req)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+
+    unsafe = {
+        "chargingProfileId": 99,
+        "stackLevel": 9,
+        "chargingProfilePurpose": "TxProfile",
+        "chargingProfileKind": "Relative",
+        "chargingSchedule": {
+            "chargingRateUnit": "A",
+            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 0}],
+        },
+    }
+    assert await cp_v16.set_charge_rate(profile=unsafe, conn_id=1) is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ocular_allows_only_exact_active_transaction_zero_amp_pause(
+    cp_v16, monkeypatch
+):
+    """The supervised pause path sends one exact transaction-bound 0 A profile."""
+    _mark_ocular(cp_v16)
+    cp_v16._active_tx[1] = 1234
+    calls = []
+
+    async def fake_call(req):
+        calls.append(req)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+    pause = {
+        "chargingProfileId": 1,
+        "stackLevel": 0,
+        "chargingProfileKind": "Relative",
+        "chargingProfilePurpose": "TxProfile",
+        "chargingSchedule": {
+            "chargingRateUnit": "A",
+            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 0}],
+        },
+        "transactionId": 1234,
+    }
+
+    assert await cp_v16.set_charge_rate(profile=pause, conn_id=1) is True
+    assert len(calls) == 1
+    assert calls[0].cs_charging_profiles == pause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_tx_id", [True, 1.5, "1", "bad", -7])
+async def test_ocular_active_state_without_transaction_id_fails_closed(
+    cp_v16, monkeypatch, raw_tx_id
+):
+    """Never install a default profile over an active but unidentified session."""
+    _mark_ocular(cp_v16)
+    cp_v16._metrics[(1, cstat.status_connector.value)] = SimpleNamespace(
+        value=ChargePointStatus.charging.value
+    )
+    cp_v16._active_tx[1] = raw_tx_id
+    calls = []
+
+    async def fake_call(req):
+        calls.append(req)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+
+    assert await cp_v16.set_charge_rate(limit_amps=16, conn_id=1) is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ocular_legacy_migration_is_tracked_per_profile_id(cp_v16, monkeypatch):
+    """A migrated connector must not suppress cleanup for another connector."""
+    calls = []
+
+    async def fake_call(req):
+        calls.append(req)
+        return SimpleNamespace(status=ClearChargingProfileStatus.unknown)
+
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+
+    assert await cp_v16._clear_ocular_legacy_profiles(1) is True
+    assert await cp_v16._clear_ocular_legacy_profiles(2) is True
+    assert [req.id for req in calls] == [1000, 2001, 3001, 2002, 3002]
 
 
 @pytest.mark.asyncio

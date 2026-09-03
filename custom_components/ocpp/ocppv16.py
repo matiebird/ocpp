@@ -409,14 +409,78 @@ class ChargePoint(cp):
             _LOGGER.debug("ClearChargingProfile raised %s (ignored)", ex)
             return False
 
+    async def _clear_ocular_legacy_profiles(self, connector_id: int) -> bool:
+        """Remove only profile IDs created by this integration's old strategy."""
+        cleared_ids = getattr(self, "_ocular_cleared_legacy_profile_ids", set())
+        self._ocular_cleared_legacy_profile_ids = cleared_ids
+        legacy_ids = (1000, 2000 + connector_id, 3000 + connector_id)
+        for profile_id in legacy_ids:
+            if profile_id in cleared_ids:
+                continue
+            try:
+                resp = await self.call(call.ClearChargingProfile(id=profile_id))
+            except Exception as ex:
+                _LOGGER.warning(
+                    "Failed clearing legacy Ocular profile %s: %s", profile_id, ex
+                )
+                return False
+            if resp.status not in (
+                ClearChargingProfileStatus.accepted,
+                ClearChargingProfileStatus.unknown,
+            ):
+                _LOGGER.warning(
+                    "Legacy Ocular profile %s was not cleared: %s",
+                    profile_id,
+                    resp.status,
+                )
+                return False
+            cleared_ids.add(profile_id)
+
+        return True
+
     async def set_charge_rate(
         self,
-        limit_amps: int = 32,
-        limit_watts: int = 22000,
+        limit_amps: int | None = None,
+        limit_watts: int | None = None,
         conn_id: int = 0,
         profile: dict | None = None,
     ) -> bool:
         """Set charge rate."""
+        charger_ids = {
+            str(getattr(self, "id", "")).strip().casefold(),
+            str(getattr(getattr(self, "settings", None), "cpid", ""))
+            .strip()
+            .casefold(),
+        }
+        is_ocular = "ocular" in charger_ids
+
+        if is_ocular and profile is not None:
+            target_cid = int(conn_id) if conn_id and int(conn_id) > 0 else 1
+            raw_tx_id = self._active_tx.get(target_cid)
+            expected_pause_profile = {
+                om.charging_profile_id.value: 1,
+                om.stack_level.value: 0,
+                om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
+                om.charging_profile_purpose.value: ChargingProfilePurposeType.tx_profile.value,
+                om.charging_schedule.value: {
+                    om.charging_rate_unit.value: ChargingRateUnitType.amps.value,
+                    om.charging_schedule_period.value: [
+                        {om.start_period.value: 0, om.limit.value: 0}
+                    ],
+                },
+                om.transaction_id.value: raw_tx_id,
+            }
+            if (
+                type(raw_tx_id) is not int
+                or raw_tx_id <= 0
+                or profile != expected_pause_profile
+            ):
+                _LOGGER.warning("Rejected custom charging profile for Ocular")
+                return False
+        if is_ocular and limit_watts is not None:
+            _LOGGER.warning("Rejected watt-based charge limit for Ocular; use amps")
+            return False
+
         if profile is not None:
             try:
                 req = call.SetChargingProfile(
@@ -433,9 +497,96 @@ class ChargePoint(cp):
                 )
             return False
 
+        if is_ocular:
+            if limit_amps is None:
+                _LOGGER.warning("Rejected empty Ocular charge-limit request")
+                return False
+            limit_value = float(limit_amps)
+            if limit_value < 6:
+                _LOGGER.warning(
+                    "Rejected unsafe Ocular charge limit %.1f A; use Remote Stop below 6 A",
+                    limit_value,
+                )
+                return False
+
+            target_cid = int(conn_id) if conn_id and int(conn_id) > 0 else 1
+            raw_tx_id = self._active_tx.get(target_cid)
+            if raw_tx_id is None:
+                active_tx_id = 0
+            elif type(raw_tx_id) is not int:
+                _LOGGER.warning(
+                    "Rejected Ocular charge limit with invalid transaction ID: %r",
+                    raw_tx_id,
+                )
+                return False
+            else:
+                active_tx_id = raw_tx_id
+            if active_tx_id < 0:
+                _LOGGER.warning(
+                    "Rejected Ocular charge limit with negative transaction ID: %s",
+                    active_tx_id,
+                )
+                return False
+
+            connector_metric = self._metrics.get(
+                (target_cid, cstat.status_connector.value)
+            )
+            connector_status = getattr(connector_metric, "value", None)
+            active_statuses = {
+                ChargePointStatus.charging.value,
+                ChargePointStatus.suspended_ev.value,
+                ChargePointStatus.suspended_evse.value,
+            }
+            if active_tx_id == 0 and connector_status in active_statuses:
+                _LOGGER.warning(
+                    "Rejected Ocular charge limit: connector is %s but no transaction ID is known",
+                    connector_status,
+                )
+                return False
+
+            purpose = (
+                ChargingProfilePurposeType.tx_profile.value
+                if active_tx_id > 0
+                else ChargingProfilePurposeType.tx_default_profile.value
+            )
+            ocular_profile = {
+                om.charging_profile_id.value: 1,
+                om.stack_level.value: 0,
+                om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
+                om.charging_profile_purpose.value: purpose,
+                om.charging_schedule.value: {
+                    om.charging_rate_unit.value: ChargingRateUnitType.amps.value,
+                    om.charging_schedule_period.value: [
+                        {om.start_period.value: 0, om.limit.value: limit_value}
+                    ],
+                },
+            }
+            if active_tx_id > 0:
+                ocular_profile[om.transaction_id.value] = active_tx_id
+
+            try:
+                req = call.SetChargingProfile(
+                    connector_id=target_cid,
+                    cs_charging_profiles=ocular_profile,
+                )
+                resp = await self.call(req)
+            except Exception as ex:
+                _LOGGER.warning("Ocular SetChargingProfile failed: %s", ex)
+                return False
+
+            if resp.status == ChargingProfileStatus.accepted:
+                return await self._clear_ocular_legacy_profiles(target_cid)
+            _LOGGER.warning("Ocular SetChargingProfile rejected: %s", resp.status)
+            return False
+
         if not (int(self.supported_features or 0) & prof.SMART):
             _LOGGER.info("Smart charging is not supported by this charger")
             return False
+
+        # Preserve the generic path's historical defaults when a caller omits
+        # one unit. Ocular is handled above and requires an explicit amp limit.
+        limit_amps = 32 if limit_amps is None else limit_amps
+        limit_watts = 22000 if limit_watts is None else limit_watts
 
         # Determine allowed unit (default to Amps if not reported)
         units_resp = await self.get_configuration(
@@ -717,7 +868,7 @@ class ChargePoint(cp):
         return False
 
     async def reset(self, typ: str = ResetType.hard):
-        """Hard reset charger unless soft reset requested."""
+        """Hard-reset the charger unless another reset type is explicitly requested."""
         self._metrics[0][cstat.reconnects.value].value = 0
         req = call.Reset(typ)
         resp = await self.call(req)
@@ -1108,7 +1259,28 @@ class ChargePoint(cp):
                 (connector_id, cstat.error_code_connector.value)
             ].value = error_code
 
-            if status in (
+            if status == ChargePointStatus.available.value:
+                # Available is authoritative OCPP proof that no transaction owns
+                # this connector. Some chargers omit StopTransaction on natural
+                # completion, so reconcile stale internal/session metrics here.
+                previous_tx = int(
+                    self._active_tx.get(
+                        connector_id,
+                        self._metrics[
+                            (connector_id, csess.transaction_id.value)
+                        ].value,
+                    )
+                    or 0
+                )
+                if previous_tx > 0:
+                    self._ended_tx[connector_id] = previous_tx
+                self._active_tx[connector_id] = 0
+                if int(self.active_transaction_id or 0) == previous_tx:
+                    self.active_transaction_id = 0
+                self._metrics[(connector_id, csess.transaction_id.value)].value = 0
+                self._metrics[(connector_id, cstat.id_tag.value)].value = ""
+                self._zero_flow_measurands(connector_id)
+            elif status in (
                 ChargePointStatus.suspended_ev.value,
                 ChargePointStatus.suspended_evse.value,
             ):

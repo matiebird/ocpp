@@ -28,6 +28,7 @@ from custom_components.ocpp.enums import (
     HAChargerServices as csvcs,
     HAChargerSession as csess,
     HAChargerStatuses as cstat,
+    OcppMisc as om,
     Profiles as prof,
 )
 from custom_components.ocpp.number import NUMBERS
@@ -43,6 +44,9 @@ from ocpp.v16.enums import (
     ChargePointErrorCode,
     ChargePointStatus,
     ChargingProfileStatus,
+    ChargingProfileKindType,
+    ChargingProfilePurposeType,
+    ChargingRateUnitType,
     ClearChargingProfileStatus,
     ConfigurationStatus,
     DataTransferStatus,
@@ -4046,6 +4050,137 @@ async def test_set_charge_rate_with_active_transaction(
             assert getattr(calls[1], "connector_id", None) == 1
             assert getattr(calls[2], "connector_id", None) == 1
 
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9360, "cp_id": "ocular", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["ocular"])
+@pytest.mark.parametrize("port", [9360])
+async def test_ocular_set_charge_rate_uses_one_charge_hq_style_tx_profile(
+    hass, socket_enabled, cp_id, port, setup_config_entry, monkeypatch
+):
+    """Ocular receives only profile 1, stack 0, bound to the active transaction."""
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            srv = cs.charge_points[cp_id]
+
+            async def fake_get_configuration(key: str = "") -> str:
+                if key == ckey.charging_schedule_allowed_charging_rate_unit.value:
+                    return "A"
+                return ""
+
+            calls = []
+
+            async def fake_call(req):
+                calls.append(req)
+                if type(req).__name__ == "ClearChargingProfile":
+                    return SimpleNamespace(status=ClearChargingProfileStatus.unknown)
+                return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+            monkeypatch.setattr(srv, "get_configuration", fake_get_configuration)
+            monkeypatch.setattr(srv, "call", fake_call)
+
+            # Before RemoteStart there is no transaction to bind. Install one
+            # TxDefaultProfile, then remove only legacy integration-owned IDs.
+            assert await srv.set_charge_rate(limit_amps=16, conn_id=1) is True
+            assert [type(req).__name__ for req in calls] == [
+                "SetChargingProfile",
+                "ClearChargingProfile",
+                "ClearChargingProfile",
+                "ClearChargingProfile",
+            ]
+            assert calls[0].connector_id == 1
+            assert [req.id for req in calls[1:]] == [1000, 2001, 3001]
+            profile = calls[0].cs_charging_profiles
+            assert profile[om.charging_profile_id.value] == 1
+            assert profile[om.stack_level.value] == 0
+            assert (
+                profile[om.charging_profile_purpose.value]
+                == ChargingProfilePurposeType.tx_default_profile.value
+            )
+            assert om.transaction_id.value not in profile
+
+            # Once charging starts, replace it with one transaction-bound
+            # TxProfile using the same single profile ID and stack level.
+            calls.clear()
+            await client.send_start_transaction(0)
+            assert await srv.set_charge_rate(limit_amps=16, conn_id=1) is True
+            assert len(calls) == 1
+            assert calls[0].connector_id == 1
+            profile = calls[0].cs_charging_profiles
+            assert profile[om.charging_profile_id.value] == 1
+            assert profile[om.stack_level.value] == 0
+            assert (
+                profile[om.charging_profile_purpose.value]
+                == ChargingProfilePurposeType.tx_profile.value
+            )
+            assert (
+                profile[om.charging_profile_kind.value]
+                == ChargingProfileKindType.relative.value
+            )
+            assert profile[om.transaction_id.value] == srv._active_tx[1]
+            assert profile[om.charging_schedule.value] == {
+                om.charging_rate_unit.value: ChargingRateUnitType.amps.value,
+                om.charging_schedule_period.value: [
+                    {om.start_period.value: 0, om.limit.value: 16.0}
+                ],
+            }
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9361, "cp_id": "ocular", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["ocular"])
+@pytest.mark.parametrize("port", [9361])
+async def test_ocular_set_charge_rate_rejects_less_than_six_amps(
+    hass, socket_enabled, cp_id, port, setup_config_entry, monkeypatch
+):
+    """Ocular never receives the unsafe zero or sub-6 A charging profile."""
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            srv = cs.charge_points[cp_id]
+            calls = []
+
+            async def fake_call(req):
+                calls.append(req)
+                return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+            monkeypatch.setattr(srv, "call", fake_call)
+
+            assert await srv.set_charge_rate(limit_amps=0, conn_id=1) is False
+            assert await srv.set_charge_rate(limit_amps=5, conn_id=1) is False
+            assert calls == []
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
