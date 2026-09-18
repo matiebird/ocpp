@@ -58,6 +58,7 @@ from .const import (
     CONFIG,
     DATA_UPDATED,
     DEFAULT_ENERGY_UNIT,
+    DEFAULT_MAX_CURRENT,
     DEFAULT_NUM_CONNECTORS,
     DEFAULT_POWER_UNIT,
     DEFAULT_MEASURAND,
@@ -75,6 +76,13 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 # never send a boot notification. Module-level so tests can shrink it
 # without monkeypatching asyncio.sleep globally.
 MONITOR_BACKSTOP_DELAY = 10
+_DEFAULT_LINE_VOLTAGE = 230.0
+_DEFAULT_PHASES = 1
+_PHASE_KEY_GROUPS = (
+    frozenset({Phase.l1.value, Phase.l2.value, Phase.l3.value}),
+    frozenset({Phase.l1_n.value, Phase.l2_n.value, Phase.l3_n.value}),
+    frozenset({Phase.l1_l2.value, Phase.l2_l3.value, Phase.l3_l1.value}),
+)
 
 
 class Metric:
@@ -279,6 +287,10 @@ class ChargePoint(cp):
         # resolved; bounds the full-update fallback to the startup window.
         self._targeted_refresh_ready = False
         self.tasks = None
+        self._session = None
+        self._start_pending = True
+        self._reconnect_token = None
+        self._retirement_tasks: set[asyncio.Task] = set()
         self._charger_reports_session_energy = False
 
         # Connector-aware, but backwards compatible:
@@ -297,6 +309,7 @@ class ChargePoint(cp):
         # completes and charging continues.
         self._remote_id_tag = "".join(secrets.choice(alphabet) for i in range(16))
         self.num_connectors: int = DEFAULT_NUM_CONNECTORS
+        self.session_controller = None
 
     def _init_connector_slots(self, conn_id: int) -> None:
         """Ensure connector-scoped metrics exist and carry the right units."""
@@ -421,6 +434,10 @@ class ChargePoint(cp):
     async def clear_profile(self):
         """Clear all charging profiles."""
         pass
+
+    async def set_station_charge_rate(self, limit_amps: int | float) -> bool:
+        """Set the station-wide maximum current without transaction fallbacks."""
+        raise NotImplementedError
 
     async def set_charge_rate(
         self,
@@ -570,13 +587,23 @@ class ChargePoint(cp):
 
     async def start(self):
         """Start charge point."""
+        # A subclass may await initialization (v1.6 loads transaction state)
+        # before reaching here. Stop/reconnect must block that pending start.
+        # Check before creating coroutines; run publishes without yielding.
+        if not self._start_pending:
+            return
+        self._start_pending = False
         await self.run([super().start(), self.monitor_connection()])
 
     async def run(self, tasks):
         """Run a specified list of tasks."""
         self.tasks = [asyncio.ensure_future(task) for task in tasks]
+        # Capture ownership before yielding; a retiring run must never stop a
+        # replacement that has since overwritten self._connection/self.tasks.
+        self._session = None
+        session = self._get_session()
         try:
-            await asyncio.gather(*self.tasks)
+            await asyncio.gather(*session["tasks"])
         except TimeoutError:
             pass
         except WebSocketException as websocket_exception:
@@ -587,32 +614,195 @@ class ChargePoint(cp):
                 exc_info=True,
             )
         finally:
-            await self.stop()
+            await self._stop_session(session)
+
+    def _get_session(self):
+        """Snapshot the transport and task set, including stop before start."""
+        if self._session is None:
+            self._session = {
+                "connection": self._connection,
+                "tasks": tuple(self.tasks or ()),
+                "cleanup": None,
+            }
+        return self._session
+
+    async def _close_session(self, session, caller):
+        """Bound the aggregate close/child join; retain, never abandon, survivors."""
+        connection = session["connection"]
+        tasks = [task for task in session["tasks"] if task is not caller]
+
+        async def close():
+            """Close this session's socket and cancel only its captured children."""
+            try:
+                if connection.state is State.OPEN:
+                    _LOGGER.debug(f"Closing websocket to '{self.id}'")
+                    await connection.close()
+            finally:
+                for task in tasks:
+                    task.cancel()
+
+        close_task = asyncio.create_task(close())
+        retirement = session["retirement"] = (*session["tasks"], close_task)
+
+        def observed(task):
+            """Retrieve a retired task's outcome before releasing owner tracking."""
+            self._retirement_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        for task in retirement:
+            self._retirement_tasks.add(task)
+            task.add_done_callback(observed)
+        # asyncio.wait does not wait for cancellation acknowledgement. Unlike
+        # wait_for/gather, this deadline includes a hostile close implementation.
+        _, pending = await asyncio.wait(
+            [close_task, *tasks],
+            timeout=getattr(self, "_retirement_timeout", 10.0),
+        )
+        if pending:
+            for task in pending:
+                task.cancel()
+            raise TimeoutError("OCPP session retirement timed out; replacement blocked")
+        close_task.result()
+
+    async def _stop_session(self, session):
+        """Share teardown and finish it even if a waiter is repeatedly cancelled."""
+        if session is self._session:
+            self.status = STATE_UNAVAILABLE
+        if session["cleanup"] is None:
+            session["cleanup"] = asyncio.create_task(
+                self._close_session(session, asyncio.current_task())
+            )
+            session["cleanup"].add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
+        elif asyncio.current_task() in session["tasks"]:
+            # An owned child's finally may call stop while the shared cleanup
+            # is gathering that child. Let it finish instead of forming a cycle;
+            # the external stopper / run finalizer still awaits full teardown.
+            return
+        cleanup = session["cleanup"]
+        cancelled = False
+        while not cleanup.done():
+            try:
+                # wait() leaves cleanup running when this waiter is cancelled.
+                # Unlike shield(), it doesn't install Python 3.14's late-error
+                # logger on cancellation; cleanup.result() below owns errors.
+                await asyncio.wait({cleanup})
+            except asyncio.CancelledError:
+                cancelled = True
+        # Observe errors even when cancellation raced completion. Teardown
+        # errors take precedence; otherwise preserve the waiter's cancellation.
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def stop(self):
-        """Close connection and cancel ongoing tasks."""
-        self.status = STATE_UNAVAILABLE
-        try:
-            if self._connection.state is State.OPEN:
-                _LOGGER.debug(f"Closing websocket to '{self.id}'")
-                await self._connection.close()
-        finally:
-            # Cancel regardless of how the close went: a close that raises or
-            # is cancelled must not leave monitor_connection running against a
-            # connection this charge point no longer owns.
-            for task in self.tasks or []:
-                task.cancel()
+        """Stop the session and invalidate pending initial start and reconnects."""
+        self._start_pending = False
+        self._reconnect_token = None
+        await self._stop_session(self._get_session())
 
     async def reconnect(self, connection: ServerConnection):
-        """Reconnect charge point."""
+        """Retire the previous session before publishing the newest replacement."""
         _LOGGER.debug(f"Reconnect websocket to {self.id}")
+        self._start_pending = False
+        token = self._reconnect_token = object()
+        candidate = {"connection": connection, "tasks": (), "cleanup": None}
+        installed = False
+        try:
+            session = self._get_session()
+            cleanup = session["cleanup"]
+            if (
+                cleanup is not None
+                and cleanup.done()
+                and any(
+                    not task.done()
+                    for task in session.get("retirement", session["tasks"])
+                )
+            ):
+                self.status = STATE_UNAVAILABLE
+                raise TimeoutError(
+                    "OCPP retirement survivors still active; replacement blocked"
+                )
+            if (
+                cleanup is not None
+                and cleanup.done()
+                and (cleanup.cancelled() or cleanup.exception() is not None)
+            ):
+                # A failed close must reject this attempt, not poison every
+                # future reconnect. Keep old waiters' teardown outcome intact.
+                self._session = None
+                session = self._get_session()
+            await self._stop_session(session)
+            if any(
+                not task.done() for task in session.get("retirement", session["tasks"])
+            ):
+                raise TimeoutError(
+                    "OCPP retirement survivors still active; replacement blocked"
+                )
+            # No await between checking admission, installing, and run capturing
+            # its task set. An overlapping reconnect supersedes this candidate;
+            # an explicit stop invalidates every request already in progress.
+            if self._reconnect_token is not token:
+                return
+            self._reset_protocol_generation_state()
+            self.status = STATE_OK
+            self._connection = connection
+            self._metrics[(0, cstat.reconnects)].value += 1
+            installed = True
+            # post connect remains handled by boot notification / monitor backstop
+            await self.run([super().start(), self.monitor_connection()])
+        finally:
+            if not installed:
+                await self._stop_session(candidate)
 
-        await self.stop()
-        self.status = STATE_OK
-        self._connection = connection
-        self._metrics[(0, cstat.reconnects)].value += 1
-        # post connect now handled on receiving boot notification or with backstop in monitor connection
-        await self.run([super().start(), self.monitor_connection()])
+    def _reset_protocol_generation_state(self) -> None:
+        """Demote protocol state that cannot remain live across a reconnect.
+
+        A reconnect is a transport boundary, not a charger-generation boundary.
+        Protocol ordering guards therefore survive it and are reset only by a
+        subsequent BootNotification.
+        """
+
+    def _report_transaction_start(
+        self, connector_id: int, transaction_id: int | str, target=None
+    ) -> None:
+        """Tell the optional session hook that a transaction started online.
+
+        The hook is not part of protocol handling: a failure inside it is
+        logged and must not turn the charger's request into an error reply
+        or skip the state changes that follow.
+        """
+        if self.session_controller is None:
+            return
+        try:
+            self.session_controller.on_transaction_start(
+                connector_id, transaction_id, target
+            )
+        except Exception:
+            _LOGGER.exception(
+                "%s: session hook failed on transaction %s start at connector %s",
+                self.id,
+                transaction_id,
+                connector_id,
+            )
+
+    def _report_transaction_end(
+        self, connector_id: int, transaction_id: int | str
+    ) -> None:
+        """Tell the optional session hook that a transaction ended."""
+        if self.session_controller is None:
+            return
+        try:
+            self.session_controller.on_transaction_end(connector_id, transaction_id)
+        except Exception:
+            _LOGGER.exception(
+                "%s: session hook failed on transaction %s end at connector %s",
+                self.id,
+                transaction_id,
+                connector_id,
+            )
 
     async def async_update_device_info(
         self, serial: str, vendor: str, model: str, firmware_version: str
@@ -760,6 +950,79 @@ class ChargePoint(cp):
                 f"id_tag='{id_tag}' not found in auth_list, default authorization_status='{auth_status}'"
             )
         return auth_status
+
+    def _lookup_metric(self, measurand: str, conn_id: int):
+        """Return a connector metric, falling back only to charger scope."""
+        metrics = getattr(self, "_metrics", None)
+        if metrics is None:
+            return None
+        try:
+            target = int(conn_id) if conn_id and int(conn_id) > 0 else 1
+        except (TypeError, ValueError):
+            target = 1
+        for cid in (target, 0):
+            key = (cid, measurand)
+            if key not in metrics:
+                continue
+            metric = metrics[key]
+            if metric is not None and getattr(metric, "value", None) is not None:
+                return metric
+        return None
+
+    def _line_voltage(self, conn_id: int) -> float:
+        """Return a plausible line-to-neutral voltage, or the 230 V default."""
+        metric = self._lookup_metric(Measurand.voltage.value, conn_id)
+        if metric is not None:
+            try:
+                voltage = float(metric.value)
+            except (TypeError, ValueError):
+                voltage = 0.0
+            if 50.0 <= voltage <= 500.0:
+                return voltage
+        return _DEFAULT_LINE_VOLTAGE
+
+    def _phase_count(self, conn_id: int) -> int:
+        """Count electrically active phases; conservatively default to one."""
+        measurands = (
+            Measurand.voltage.value,
+            Measurand.current_import.value,
+            Measurand.current_offered.value,
+        )
+        best = 0
+        for measurand in measurands:
+            metric = self._lookup_metric(measurand, conn_id)
+            if metric is None:
+                continue
+            phase_values = {
+                str(key): value for key, value in (metric.extra_attr or {}).items()
+            }
+            threshold = 50.0 if measurand == Measurand.voltage.value else 0.1
+            for group in _PHASE_KEY_GROUPS:
+                count = 0
+                for phase in group:
+                    if phase not in phase_values:
+                        continue
+                    try:
+                        value = abs(float(phase_values[phase]))
+                    except (TypeError, ValueError):
+                        continue
+                    if value >= threshold:
+                        count += 1
+                best = max(best, count)
+        return best or _DEFAULT_PHASES
+
+    def _amps_to_watts(self, amps: float, conn_id: int) -> float:
+        """Convert current to power with the shared electrical assumptions."""
+        return float(
+            round(amps * self._line_voltage(conn_id) * self._phase_count(conn_id))
+        )
+
+    def _watts_to_amps(self, watts: float, conn_id: int) -> float:
+        """Convert power to current with the shared electrical assumptions."""
+        denominator = self._line_voltage(conn_id) * self._phase_count(conn_id)
+        if denominator <= 0:
+            return float(DEFAULT_MAX_CURRENT)
+        return round(watts / denominator, 1)
 
     def process_phases(self, data: list[MeasurandValue], connector_id: int = 0):
         """Process per-phase MeterValues and aggregate them into per-connector metrics.
@@ -1043,6 +1306,38 @@ class ChargePoint(cp):
                     # For EAIR: process only the best candidate in this bucket, skip others (incl. Transaction.Begin)
                     if is_eair and idx != best_eair_idx:
                         continue
+
+                    # A transaction-bound EAIR sample below meter_start cannot
+                    # be a lifetime register reading: the charger is reporting
+                    # SESSION energy in MeterValues while StartTransaction
+                    # reported a lifetime meter_start, so the meter_start == 0
+                    # detection above never fired. Switch mode here, before
+                    # skip_eair is evaluated, so the sample is neither written to
+                    # the lifetime metric nor published as a negative on a
+                    # total_increasing sensor.
+                    if (
+                        is_eair
+                        and is_transaction
+                        and not self._charger_reports_session_energy
+                    ):
+                        ms_metric = self._metrics[(target_cid, csess.meter_start)]
+                        if (
+                            ms_metric.value is not None
+                            and ms_metric.unit == unit
+                            and value < ms_metric.value
+                        ):
+                            _LOGGER.warning(
+                                "%s[%s]: Energy.Active.Import.Register sample "
+                                "%s %s is below meter_start %s %s. Treating this "
+                                "charger as reporting session energy directly.",
+                                csess.session_energy,
+                                target_cid,
+                                value,
+                                unit,
+                                ms_metric.value,
+                                ms_metric.unit,
+                            )
+                            self._charger_reports_session_energy = True
 
                     # Determine whether to skip writing EAIR to the main metric:
                     # - Skip only if this is an EAIR reading,
